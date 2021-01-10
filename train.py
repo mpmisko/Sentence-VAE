@@ -11,8 +11,7 @@ from collections import OrderedDict, defaultdict
 
 from ptb import PTB
 from utils import to_var, idx2word, expierment_name
-from model import SentenceVAE, loss_fn
-
+from model import SentenceVAE, loss_fn, Discriminator
 
 def main(args):
     ts = time.strftime('%Y-%b-%d-%H:%M:%S', time.gmtime())
@@ -47,12 +46,24 @@ def main(args):
     )
 
     NLL = torch.nn.NLLLoss(ignore_index=datasets['train'].pad_idx, reduction='none')
-    model = SentenceVAE(**params)
-    #gen_model2 = SentenceVAE(**params)
-    if torch.cuda.is_available():
-        model = model.cuda()
+    g1 = SentenceVAE(**params)
+    g2 = SentenceVAE(**params)
+    d = Discriminator(**params)
+    opt1 = torch.optim.Adam(g1.parameters(), lr=args.learning_rate)
+    opt2 = torch.optim.Adam(g2.parameters(), lr=args.learning_rate)
+    opt_d = torch.optim.Adam(d.parameters(), lr=args.learning_rate)
+    is_d = True
+    g_active, g_passive = g1, g2
+    opt_active, opt_passive = opt1, opt2
 
-    print(model)
+    print("Generator 1:", g1)
+    print("Generator 2:", g2)
+    print("Discriminator:", d)
+
+    if torch.cuda.is_available():
+        g1 = g1.cuda()
+        g2 = g2.cuda()
+        d = d.cuda()
 
     if args.tensorboard_logging:
         writer = SummaryWriter(os.path.join(args.logdir, expierment_name(args, ts)))
@@ -65,8 +76,6 @@ def main(args):
 
     with open(os.path.join(save_model_path, 'model_params.json'), 'w') as f:
         json.dump(params, f, indent=4)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.Tensor
     step = 0
@@ -86,9 +95,13 @@ def main(args):
 
             # Enable/Disable Dropout
             if split == 'train':
-                model.train()
+                g1.train()
+                g2.train()
+                d.train()
             else:
-                model.eval()
+                g1.eval()
+                g2.eval()
+                d.eval()
 
             for iteration, batch in enumerate(data_loader):
 
@@ -98,38 +111,44 @@ def main(args):
                     if torch.is_tensor(v):
                         batch[k] = to_var(v)
 
-                # Forward pass
-                logp, mean, logv, z = model(batch['input'], batch['length'])
+                # Generate fake sequences from passive
+                x_fake, z, passive_nll = g_passive.inference(NLL, args, n=batch_size)
+                fake_lengths = torch.ones([batch_size]).long() * args.max_sequence_length
 
-                # loss calculation
-                NLL_loss, KL_loss, KL_weight = loss_fn(NLL, logp, batch['target'],
-                    batch['length'], mean, logv, args.anneal_function, step, args.k, args.x0)
-
-                loss = torch.mean(NLL_loss + KL_weight * KL_loss)
+                # Compute log likelihood from the active generator
+                logp, mean, logv, z = g_active(x_fake, fake_lengths)
+                NLL_loss, KL_loss, KL_weight = loss_fn(NLL, logp, x_fake,
+                    fake_lengths, mean, logv, args.anneal_function, step, args.k, args.x0)
+                active_nll = NLL_loss + KL_weight * KL_loss
+                
+                d_fake = torch.log(1 - d(x_fake, fake_lengths) + 1e-3)
+                g_objective = torch.mean(d_fake - active_nll + passive_nll)
+                d_real = d(batch['input'], batch['length'])
+                d_objective = -g_objective - torch.mean(torch.log(d_real + 1e-3))
 
                 # backward + optimization
                 if split == 'train':
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                    if is_d:
+                        opt_d.zero_grad()
+                        d_objective.backward()
+                        opt_d.step()
+                    else:
+                        opt_active.zero_grad()
+                        g_objective.backward()
+                        opt_active.step()
                     step += 1
 
-                # bookkeepeing
-                tracker['ELBO'] = torch.cat((tracker['ELBO'], loss.data.view(1, -1)), dim=0)
-
-                if args.tensorboard_logging:
-                    writer.add_scalar("%s/ELBO" % split.upper(), loss.item(), epoch*len(data_loader) + iteration)
-                    writer.add_scalar("%s/NLL Loss" % split.upper(), NLL_loss.item() / batch_size,
-                                      epoch*len(data_loader) + iteration)
-                    writer.add_scalar("%s/KL Loss" % split.upper(), KL_loss.item() / batch_size,
-                                      epoch*len(data_loader) + iteration)
-                    writer.add_scalar("%s/KL Weight" % split.upper(), KL_weight,
-                                      epoch*len(data_loader) + iteration)
+                if is_d and iteration % args.switch == 0:
+                    is_d = False
+                    g_active, g_passive = g_passive, g_active
+                    opt_active, opt_passive = opt_passive, opt_active
+                elif iteration % args.switch == 0:
+                    is_d = True
 
                 if iteration % args.print_every == 0 or iteration+1 == len(data_loader):
-                    print("%s Batch %04d/%i, Loss %9.4f, NLL-Loss %9.4f, KL-Loss %9.4f, KL-Weight %6.3f"
-                          % (split.upper(), iteration, len(data_loader)-1, loss.item(), NLL_loss.item()/batch_size,
-                          KL_loss.item()/batch_size, KL_weight))
+                    print("%s Batch %04d/%i, NLL-Loss %9.4f, KL-Loss %9.4f, KL-Weight %6.3f, GEN %9.4f, DISC %9.4f"
+                          % (split.upper(), iteration, len(data_loader)-1, torch.mean(NLL_loss).item(),
+                          torch.mean(KL_loss).item(), KL_weight, g_objective.item(), d_objective.item()))
 
                 if split == 'valid':
                     if 'target_sents' not in tracker:
@@ -138,10 +157,6 @@ def main(args):
                                                         pad_idx=datasets['train'].pad_idx)
                     tracker['z'] = torch.cat((tracker['z'], z.data), dim=0)
 
-            print("%s Epoch %02d/%i, Mean ELBO %9.4f" % (split.upper(), epoch, args.epochs, tracker['ELBO'].mean()))
-
-            if args.tensorboard_logging:
-                writer.add_scalar("%s-Epoch/ELBO" % split.upper(), torch.mean(tracker['ELBO']), epoch)
 
             # save a dump of all sentences and the encoded latent space
             if split == 'valid':
@@ -154,7 +169,7 @@ def main(args):
             # save checkpoint
             if split == 'train':
                 checkpoint_path = os.path.join(save_model_path, "E%i.pytorch" % epoch)
-                torch.save(model.state_dict(), checkpoint_path)
+                torch.save(g1.state_dict(), checkpoint_path)
                 print("Model saved at %s" % checkpoint_path)
 
 
@@ -185,6 +200,7 @@ if __name__ == '__main__':
     parser.add_argument('-x0', '--x0', type=int, default=2500)
 
     parser.add_argument('-v', '--print_every', type=int, default=50)
+    parser.add_argument('-s', '--switch', type=int, default=5)
     parser.add_argument('-tb', '--tensorboard_logging', action='store_true')
     parser.add_argument('-log', '--logdir', type=str, default='logs')
     parser.add_argument('-bin', '--save_model_path', type=str, default='bin')

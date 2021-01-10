@@ -229,7 +229,7 @@ class SentenceVAE(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self, vocab_size, embedding_size, rnn_type, hidden_size, word_dropout, embedding_dropout, latent_size,
-                sos_idx, eos_idx, pad_idx, unk_idx, max_sequence_length, num_layers=1, bidirectional=False):
+                sos_idx, eos_idx, pad_idx, unk_idx, max_sequence_length, num_layers=2, bidirectional=False):
 
         super().__init__()
         self.tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.Tensor
@@ -275,4 +275,4 @@ class Discriminator(nn.Module):
         _, hidden = self.discriminator_rnn(packed_input)
         out = self.out(hidden.squeeze())
 
-        return nn.Sigmoid(out)
+        return torch.sigmoid(out).squeeze()
