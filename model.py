@@ -2,7 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.rnn as rnn_utils
 from utils import to_var
+import numpy as np
 
+def kl_anneal_function(anneal_function, step, k, x0):
+    if anneal_function == 'logistic':
+        return float(1/(1+np.exp(-k*(step-x0))))
+    elif anneal_function == 'linear':
+        return min(1, step/x0)
+        
+def loss_fn(NLL, logp, target, length, mean, logv, anneal_function, step, k, x0):
+        # cut-off unnecessary padding from target, and flatten
+        old_shape = logp.size()
+        target = torch.reshape(target[:, :torch.max(length).item()].contiguous(), (logp.size(0) * logp.size(1),))
+        logp = torch.reshape(logp, (logp.size(0) * logp.size(1), logp.size(-1)))
+
+        # Negative Log Likelihood
+        NLL_loss = NLL(logp, target)
+        NLL_loss = torch.reshape(NLL_loss, (old_shape[0], old_shape[1])).sum(1)
+
+        # KL Divergence
+        KL_loss = -0.5 * (1 + logv - mean.pow(2) - logv.exp()).sum(1)
+        KL_weight = kl_anneal_function(anneal_function, step, k, x0)
+
+        return NLL_loss, KL_loss, KL_weight
 
 class SentenceVAE(nn.Module):
     def __init__(self, vocab_size, embedding_size, rnn_type, hidden_size, word_dropout, embedding_dropout, latent_size,
@@ -114,8 +136,12 @@ class SentenceVAE(nn.Module):
 
         return logp, mean, logv, z
 
-    def inference(self, n=4, z=None):
+    def get_seq_likelihood(self, seq, lengths, NLL, args):
+        logp, mean, logv, _ = self(seq, lengths)
+        NLL_loss, KL_loss, KL_weight = loss_fn(NLL, logp, seq, lengths, mean, logv, args.anneal_function, 0, args.k, args.x0)
+        return NLL_loss + KL_loss * KL_weight
 
+    def inference(self, NLL=None, args=None, n=4, z=None):
         if z is None:
             batch_size = n
             z = to_var(torch.randn([batch_size, self.latent_size]))
@@ -176,7 +202,11 @@ class SentenceVAE(nn.Module):
 
             t += 1
 
-        return generations, z
+        likelihood = None
+        if NLL:
+            lengths = torch.ones([batch_size]).long() * self.max_sequence_length
+            likelihood = self.get_seq_likelihood(generations, lengths, NLL, args)
+        return generations, z, likelihood
 
     def _sample(self, dist, mode='greedy'):
 
@@ -195,3 +225,54 @@ class SentenceVAE(nn.Module):
         save_to[running_seqs] = running_latest
 
         return save_to
+
+
+class Discriminator(nn.Module):
+    def __init__(self, vocab_size, embedding_size, rnn_type, hidden_size, word_dropout, embedding_dropout, latent_size,
+                sos_idx, eos_idx, pad_idx, unk_idx, max_sequence_length, num_layers=1, bidirectional=False):
+
+        super().__init__()
+        self.tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.Tensor
+
+        self.max_sequence_length = max_sequence_length
+        self.sos_idx = sos_idx
+        self.eos_idx = eos_idx
+        self.pad_idx = pad_idx
+        self.unk_idx = unk_idx
+
+        self.latent_size = latent_size
+
+        self.rnn_type = rnn_type
+        self.bidirectional = bidirectional
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+
+        self.embedding = nn.Embedding(vocab_size, embedding_size)
+
+        if rnn_type == 'rnn':
+            rnn = nn.RNN
+        elif rnn_type == 'gru':
+            rnn = nn.GRU
+        else:
+            raise ValueError()
+
+        self.discriminator_rnn = rnn(embedding_size, hidden_size, num_layers=num_layers, bidirectional=self.bidirectional,
+                               batch_first=True)
+        self.out = nn.Linear(hidden_size, 1)
+        
+
+    def forward(self, input_sequence, length):
+
+        batch_size = input_sequence.size(0)
+        sorted_lengths, sorted_idx = torch.sort(length, descending=True)
+        input_sequence = input_sequence[sorted_idx]
+
+        # ENCODER
+        input_embedding = self.embedding(input_sequence)
+
+        packed_input = rnn_utils.pack_padded_sequence(input_embedding, sorted_lengths.data.tolist(), batch_first=True)
+
+        _, hidden = self.discriminator_rnn(packed_input)
+        out = self.out(hidden.squeeze())
+
+        return nn.Sigmoid(out)

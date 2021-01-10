@@ -11,7 +11,7 @@ from collections import OrderedDict, defaultdict
 
 from ptb import PTB
 from utils import to_var, idx2word, expierment_name
-from model import SentenceVAE
+from model import SentenceVAE, loss_fn
 
 
 def main(args):
@@ -45,8 +45,10 @@ def main(args):
         num_layers=args.num_layers,
         bidirectional=args.bidirectional
     )
-    model = SentenceVAE(**params)
 
+    NLL = torch.nn.NLLLoss(ignore_index=datasets['train'].pad_idx, reduction='none')
+    model = SentenceVAE(**params)
+    #gen_model2 = SentenceVAE(**params)
     if torch.cuda.is_available():
         model = model.cuda()
 
@@ -63,28 +65,6 @@ def main(args):
 
     with open(os.path.join(save_model_path, 'model_params.json'), 'w') as f:
         json.dump(params, f, indent=4)
-
-    def kl_anneal_function(anneal_function, step, k, x0):
-        if anneal_function == 'logistic':
-            return float(1/(1+np.exp(-k*(step-x0))))
-        elif anneal_function == 'linear':
-            return min(1, step/x0)
-
-    NLL = torch.nn.NLLLoss(ignore_index=datasets['train'].pad_idx, reduction='sum')
-    def loss_fn(logp, target, length, mean, logv, anneal_function, step, k, x0):
-
-        # cut-off unnecessary padding from target, and flatten
-        target = target[:, :torch.max(length).item()].contiguous().view(-1)
-        logp = logp.view(-1, logp.size(2))
-
-        # Negative Log Likelihood
-        NLL_loss = NLL(logp, target)
-
-        # KL Divergence
-        KL_loss = -0.5 * torch.sum(1 + logv - mean.pow(2) - logv.exp())
-        KL_weight = kl_anneal_function(anneal_function, step, k, x0)
-
-        return NLL_loss, KL_loss, KL_weight
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -122,10 +102,10 @@ def main(args):
                 logp, mean, logv, z = model(batch['input'], batch['length'])
 
                 # loss calculation
-                NLL_loss, KL_loss, KL_weight = loss_fn(logp, batch['target'],
+                NLL_loss, KL_loss, KL_weight = loss_fn(NLL, logp, batch['target'],
                     batch['length'], mean, logv, args.anneal_function, step, args.k, args.x0)
 
-                loss = (NLL_loss + KL_weight * KL_loss) / batch_size
+                loss = torch.mean(NLL_loss + KL_weight * KL_loss)
 
                 # backward + optimization
                 if split == 'train':
