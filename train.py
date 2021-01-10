@@ -112,19 +112,24 @@ def main(args):
                         batch[k] = to_var(v)
 
                 # Generate fake sequences from passive
-                x_fake, z, passive_nll = g_passive.inference(NLL, args, n=batch_size)
+                x_fake, z, passive_nll = g_passive.inference(NLL, args, n=batch_size, ts=batch['target'], lens=batch['length'])
                 fake_lengths = torch.ones([batch_size]).long() * args.max_sequence_length
 
                 # Compute log likelihood from the active generator
                 logp, mean, logv, z = g_active(x_fake, fake_lengths)
-                NLL_loss, KL_loss, KL_weight = loss_fn(NLL, logp, x_fake,
-                    fake_lengths, mean, logv, args.anneal_function, step, args.k, args.x0)
+                NLL_loss, KL_loss, KL_weight = loss_fn(NLL, logp, batch['target'],
+                    batch['length'], mean, logv, args.anneal_function, step, args.k, args.x0)
                 active_nll = NLL_loss + KL_weight * KL_loss
+                active_real_nll = g_active.get_seq_likelihood(batch['target'], batch['length'], NLL, args)
                 
+                d_real = torch.log(1 - d(batch['input'], batch['length']) + 1e-3)
                 d_fake = torch.log(1 - d(x_fake, fake_lengths) + 1e-3)
                 g_objective = torch.mean(d_fake - active_nll + passive_nll)
+                g_objective += torch.mean(d_real - active_real_nll + passive_real_nll)
+                g_objective /= 2
+
                 d_real = d(batch['input'], batch['length'])
-                d_objective = -g_objective - torch.mean(torch.log(d_real + 1e-3))
+                d_objective = -torch.mean(d_fake) - torch.mean(torch.log(d_real + 1e-3))
 
                 # backward + optimization
                 if split == 'train':
@@ -184,7 +189,7 @@ if __name__ == '__main__':
 
     parser.add_argument('-ep', '--epochs', type=int, default=10)
     parser.add_argument('-bs', '--batch_size', type=int, default=32)
-    parser.add_argument('-lr', '--learning_rate', type=float, default=0.001)
+    parser.add_argument('-lr', '--learning_rate', type=float, default=0.0001)
 
     parser.add_argument('-eb', '--embedding_size', type=int, default=300)
     parser.add_argument('-rnn', '--rnn_type', type=str, default='gru')

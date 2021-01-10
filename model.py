@@ -141,7 +141,7 @@ class SentenceVAE(nn.Module):
         NLL_loss, KL_loss, KL_weight = loss_fn(NLL, logp, seq, lengths, mean, logv, args.anneal_function, 0, args.k, args.x0)
         return NLL_loss + KL_loss * KL_weight
 
-    def inference(self, NLL=None, args=None, n=4, z=None):
+    def inference(self, NLL=None, args=None, n=4, z=None, ts=None, lens=None):
         if z is None:
             batch_size = n
             z = to_var(torch.randn([batch_size, self.latent_size]))
@@ -204,8 +204,7 @@ class SentenceVAE(nn.Module):
 
         likelihood = None
         if NLL:
-            lengths = torch.ones([batch_size]).long() * self.max_sequence_length
-            likelihood = self.get_seq_likelihood(generations, lengths, NLL, args)
+            likelihood = self.get_seq_likelihood(ts, lens, NLL, args)
         return generations, z, likelihood
 
     def _sample(self, dist, mode='greedy'):
